@@ -1,0 +1,157 @@
+---
+- name: Deploy and Configure HashiCorp Vault on RHEL
+  hosts: vault
+  become: true
+  vars:
+    vault_version: "1.15.4"
+    vault_user: "vault"
+    vault_group: "vault"
+    vault_install_dir: "/usr/bin"
+    vault_data_dir: "/opt/vault/data"
+    vault_config_dir: "/etc/vault"
+    vault_config_file: "/etc/vault/vault.hcl"
+    vault_service_file: "/etc/systemd/system/vault.service"
+    vault_api_addr: "http://{{ ansible_host }}:8200"
+    vault_cluster_addr: "http://{{ ansible_host }}:8201"
+    vault_addr_env: "http://{{ ansible_host }}:8200"
+    vault_key_shares: 5
+    vault_key_threshold: 3
+
+  tasks:
+    - name: Install required packages
+      yum:
+        name:
+          - wget
+          - unzip
+        state: present
+
+    - name: Download Vault binary
+      get_url:
+        url: "https://releases.hashicorp.com/vault/{{ vault_version }}/vault_{{ vault_version }}_linux_amd64.zip"
+        dest: "/tmp/vault_{{ vault_version }}_linux_amd64.zip"
+        mode: '0644'
+
+    - name: Unzip Vault binary
+      unarchive:
+        src: "/tmp/vault_{{ vault_version }}_linux_amd64.zip"
+        dest: "/tmp"
+        remote_src: yes
+
+    - name: Move Vault binary to install directory
+      copy:
+        src: "/tmp/vault"
+        dest: "{{ vault_install_dir }}/vault"
+        mode: '0755'
+        remote_src: yes
+
+    - name: Create vault user and group
+      user:
+        name: "{{ vault_user }}"
+        system: yes
+        home: "{{ vault_config_dir }}"
+        shell: /bin/false
+        create_home: yes
+
+    - name: Create Vault data and config directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ vault_user }}"
+        group: "{{ vault_group }}"
+        mode: '0755'
+      loop:
+        - "{{ vault_data_dir }}"
+        - "{{ vault_config_dir }}"
+
+    - name: Create vault.hcl configuration file
+      copy:
+        dest: "{{ vault_config_file }}"
+        content: |
+          ui = true
+          disable_mlock = true
+          storage "file" {
+            path = "{{ vault_data_dir }}"
+          }
+          listener "tcp" {
+            address     = "0.0.0.0:8200"
+            tls_disable = true
+          }
+          api_addr = "{{ vault_api_addr }}"
+          cluster_addr = "{{ vault_cluster_addr }}"
+        owner: "{{ vault_user }}"
+        group: "{{ vault_group }}"
+        mode: '0644'
+
+    - name: Create systemd service file for Vault
+      copy:
+        dest: "{{ vault_service_file }}"
+        content: |
+          [Unit]
+          Description=HashiCorp Vault Service
+          Documentation=https://www.vaultproject.io/docs
+          After=network.target
+          ConditionFileNotEmpty={{ vault_config_file }}
+
+          [Service]
+          User={{ vault_user }}
+          Group={{ vault_group }}
+          ExecStart={{ vault_install_dir }}/vault server -config={{ vault_config_file }}
+          ExecReload=/bin/kill -HUP $MAINPID
+          KillMode=process
+          Restart=on-failure
+          RestartSec=5
+          LimitNOFILE=65536
+          Environment="VAULT_ADDR=http://0.0.0.0:8200"
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Reload systemd and start Vault service
+      systemd:
+        daemon_reload: yes
+        name: vault
+        enabled: yes
+        state: started
+
+    - name: Set VAULT_ADDR environment variable for current session
+      lineinfile:
+        path: /etc/profile.d/vault.sh
+        line: "export VAULT_ADDR={{ vault_addr_env }}"
+        create: yes
+        mode: '0755'
+
+    - name: Wait for Vault API to be available
+      uri:
+        url: "{{ vault_api_addr }}/v1/sys/health"
+        method: GET
+        status_code: 501
+      register: vault_health
+      retries: 10
+      delay: 3
+      until: vault_health.status == 501
+
+    # The following steps (init, unseal, auth) are typically manual for security.
+    # You can uncomment and adapt them if you want to automate with extra vars.
+
+    # - name: Initialize Vault (one-time operation)
+    #   command: >
+    #     vault operator init -key-shares={{ vault_key_shares }} -key-threshold={{ vault_key_threshold }}
+    #   environment:
+    #     VAULT_ADDR: "{{ vault_addr_env }}"
+    #   register: vault_init
+    #   changed_when: false
+
+    # - name: Display Vault initialization output
+    #   debug:
+    #     var: vault_init.stdout
+
+    # - name: Unseal Vault (repeat for each key)
+    #   command: vault operator unseal <unseal-key>
+    #   environment:
+    #     VAULT_ADDR: "{{ vault_addr_env }}"
+
+    # - name: Authenticate with root token
+    #   command: vault login <root-token>
+    #   environment:
+    #     VAULT_ADDR: "{{ vault_addr_env }}"
